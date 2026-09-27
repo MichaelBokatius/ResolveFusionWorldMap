@@ -5,8 +5,6 @@ Robinson political world map. It draws every country outline and fills exactly
 one selectable country, with full control over projection centring, zoom, pan,
 stroke and fill. Output is transparent premultiplied RGBA, ready to composite.
 
-![South Korea highlighted, Greenwich centred](tests/output/greenwich_kr.png)
-
 ## What it does
 
 - **All country outlines** drawn from the exact source SVG geometry.
