@@ -1,0 +1,1011 @@
+--[[============================================================================
+  WorldMap.fuse  —  Political world map generator for DaVinci Resolve Fusion
+
+  Renders the Wikimedia BlankMap-World Robinson political map: draws every
+  country outline and fills exactly one selectable country.  All geometry is
+  loaded from generated/worldmap_data.lua (built by tools/build_worldmap_data.py
+  from the source SVG); this Fuse performs NO SVG parsing at runtime.
+
+  Features
+    * Constant screen-pixel stroke width at any zoom level.
+    * Proper Robinson re-centring on a chosen central meridian (not a pixel pan),
+      with antimeridian seam splitting so nothing streaks across the frame.
+    * Transparent premultiplied RGBA output.
+    * Controls: Center (pan), Zoom, Origin/Custom meridian, stroke colour/width/
+      opacity, country selection, fill colour/opacity, world & disputed toggles.
+
+  This is a CPU scanline rasteriser: Fusion exposes no public antialiased vector
+  fill API to Fuses, so filling and stroking are implemented here directly.
+============================================================================]]--
+
+FuRegisterClass("WorldMap", CT_Tool, {
+    REGS_Name              = "World Map",
+    REGS_Category          = "Creator",
+    REGS_OpIconString      = "WMap",
+    REGS_OpDescription     = "Robinson political world map; outlines all countries, fills one.",
+    REGS_Company           = "ResolveFusionWorldMap",
+    REGS_URL               = "",
+    REG_Fuse_NoEdit        = false,
+    REG_Fuse_NoReload      = false,
+    REG_SupportsDoD        = false,
+    REG_NoMotionBlurCtrls  = false,
+    REG_NoBlendCtrls       = false,
+    REG_TimeVariant        = false,
+})
+
+-- Bump on every edit so the Console proves which build Fusion actually loaded.
+local FUSE_VERSION = "2026-09-13.16"
+print("[WorldMap] fuse chunk loaded, build " .. FUSE_VERSION)
+
+-- ---------------------------------------------------------------------------
+-- Data loading (cached across instances via a module-level table)
+-- ---------------------------------------------------------------------------
+local DATA          = nil     -- parsed worldmap_data.lua module table
+local DATA_ERROR    = nil     -- string describing why the data could not load
+local COUNTRY_NAMES = {}      -- ordered list of display names for the combo
+local COUNTRY_INDEX = {}      -- 1-based combo index -> country table
+
+-- Single-slot result cache (bounded memory: at most one frame is retained).
+-- Holds the last rendered image plus a signature of the inputs that produced
+-- it; an identical request reuses the frame instead of re-rasterising the whole
+-- map. This avoids the heavy recompute spikes that can freeze/crash Resolve
+-- when Fusion re-requests a frame (e.g. after a cache eviction during playback).
+local CACHE_SIG = nil
+local CACHE_IMG = nil
+
+local function script_dir()
+    -- Directory containing this .fuse file.
+    local src = debug and debug.getinfo and debug.getinfo(1, "S")
+    local path = src and src.source or ""
+    path = path:gsub("^@", "")
+    return path:match("^(.*[/\\])") or ""
+end
+
+local function candidate_data_paths()
+    local here = script_dir()
+    return {
+        here .. "worldmap_data.lua",
+        here .. "../generated/worldmap_data.lua",
+        here .. "generated/worldmap_data.lua",
+    }
+end
+
+local function load_data()
+    if DATA or DATA_ERROR then return end
+    local tried = {}
+    for _, p in ipairs(candidate_data_paths()) do
+        tried[#tried + 1] = p
+        local ok, chunk = pcall(loadfile, p)
+        if ok and chunk then
+            local ok2, mod = pcall(chunk)
+            if ok2 and type(mod) == "table" and mod.countries then
+                DATA = mod
+                break
+            end
+        end
+    end
+    if not DATA then
+        DATA_ERROR = "worldmap_data.lua not found next to WorldMap.fuse or in " ..
+                     "../generated/. Run tools/build_worldmap_data.py. Tried: " ..
+                     table.concat(tried, " ; ")
+        return
+    end
+    -- Build ordered combo lists (skip the ocean/world boundary entry) and sort
+    -- the countries alphabetically by display name for an easy-to-scan dropdown.
+    local list = {}
+    for _, c in ipairs(DATA.countries) do
+        if c.kind ~= "ocean" then
+            list[#list + 1] = c
+        end
+    end
+    table.sort(list, function(a, b) return a.name:lower() < b.name:lower() end)
+    COUNTRY_NAMES = {}
+    COUNTRY_INDEX = {}
+    for _, c in ipairs(list) do
+        COUNTRY_NAMES[#COUNTRY_NAMES + 1] = c.name
+        COUNTRY_INDEX[#COUNTRY_INDEX + 1] = c
+    end
+end
+
+-- Default selection: South Korea if present, else the first country.
+local function default_country_index()
+    for i, c in ipairs(COUNTRY_INDEX) do
+        if c.code == "kr" then return i end
+    end
+    return 1
+end
+
+-- ---------------------------------------------------------------------------
+-- City markers: top-10-per-country dataset (generated/cities_data.lua).
+-- ---------------------------------------------------------------------------
+local CITIES       = {}       -- combo index (1 = first city) -> city table
+local CITY_LABELS  = {}       -- parallel display labels for the combo
+local CITIES_ERROR = nil
+
+local function city_data_paths()
+    local here = script_dir()
+    return {
+        here .. "cities_data.lua",
+        here .. "../generated/cities_data.lua",
+        here .. "generated/cities_data.lua",
+    }
+end
+
+local function load_cities()
+    if #CITIES > 0 or CITIES_ERROR then return end
+    local mod
+    for _, p in ipairs(city_data_paths()) do
+        local ok, chunk = pcall(loadfile, p)
+        if ok and chunk then
+            local ok2, m = pcall(chunk)
+            if ok2 and type(m) == "table" and m.cities then mod = m; break end
+        end
+    end
+    if not mod then
+        CITIES_ERROR = "cities_data.lua not found (run tools/build_cities_data.py)"
+        return
+    end
+    for _, c in ipairs(mod.cities) do
+        CITIES[#CITIES + 1] = c
+        CITY_LABELS[#CITY_LABELS + 1] = c.name .. ", " .. c.country
+    end
+end
+
+-- Case-insensitive substring lookup used by the Country/City search fields.
+-- Returns the 1-based index of the first matching label, or nil.
+local function find_label_match(labels, text)
+    if not text or text == "" then return nil end
+    local needle = text:lower()
+    for i, lbl in ipairs(labels) do
+        if lbl:lower():find(needle, 1, true) then return i end
+    end
+    return nil
+end
+
+-- Read a Text input defensively (offline stubs may hand back a number).
+local function input_text(inp, req)
+    if not inp then return "" end
+    local ok, val = pcall(function() return inp:GetValue(req).Value end)
+    if ok and type(val) == "string" then return val end
+    return ""
+end
+
+-- Add a single-line text control. Wrapped in pcall so an unsupported control on
+-- an older Resolve build can never abort Create() (which would drop the node's
+-- output); the search field simply won't appear and the dropdowns still work.
+local function add_text_input(tool, name, id)
+    local ok, inp = pcall(function()
+        return tool:AddInput(name, id, {
+            LINKID_DataType = "Text",
+            INPID_InputControl = "TextEditControl",
+            INP_External = false,
+            TEC_Lines = 1,
+        })
+    end)
+    if ok then return inp end
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Origin / central-meridian presets
+-- ---------------------------------------------------------------------------
+local ORIGIN_PRESETS = { 0.0, 162.0, 180.0, -90.0, nil }  -- last = Custom
+local ORIGIN_LABELS  = { "Greenwich (0°)", "Asia-Pacific (162°E)",
+                         "Pacific (180°E)", "Americas (90°W)", "Custom" }
+
+-- ===========================================================================
+-- Create():  declare all inputs and the output.
+-- ===========================================================================
+function Create()
+    print("[WorldMap] Create() begin, build " .. FUSE_VERSION)
+    load_data()
+    load_cities()
+
+    self:BeginControlNest("Projection", "Projection", true, {})
+
+        InOrigin = self:AddInput("Origin", "Origin", {
+            LINKID_DataType = "Number", INPID_InputControl = "ComboControl",
+            INP_Integer = true, INP_Default = 0,
+            { CCS_AddString = ORIGIN_LABELS[1] },
+            { CCS_AddString = ORIGIN_LABELS[2] },
+            { CCS_AddString = ORIGIN_LABELS[3] },
+            { CCS_AddString = ORIGIN_LABELS[4] },
+            { CCS_AddString = ORIGIN_LABELS[5] },
+        })
+
+        InCustomMeridian = self:AddInput("Custom Meridian", "CustomMeridian", {
+            LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+            INP_Default = 0.0, INP_MinScale = -180.0, INP_MaxScale = 180.0,
+            INP_MinAllowed = -360.0, INP_MaxAllowed = 360.0,
+        })
+
+        InCenter = self:AddInput("Center", "Center", {
+            LINKID_DataType = "Point", INPID_InputControl = "OffsetControl",
+            INPID_PreviewControl = "CrosshairControl",
+            INP_DefaultX = 0.5, INP_DefaultY = 0.5,
+        })
+
+        InZoom = self:AddInput("Zoom", "Zoom", {
+            LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+            INP_Default = 1.0, INP_MinScale = 0.1, INP_MaxScale = 10.0,
+            INP_MinAllowed = 0.01, INP_MaxAllowed = 100.0,
+        })
+
+    self:EndControlNest()
+
+    self:BeginControlNest("Outline", "Outline", true, {})
+
+        InStrokeColor = self:AddInput("Stroke Color", "StrokeColor", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.1, IC_ControlGroup = 5, IC_ControlID = 0,
+        })
+        InStrokeGreen = self:AddInput("Stroke Green", "StrokeGreen", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.1, IC_ControlGroup = 5, IC_ControlID = 1, IC_Visible = false,
+        })
+        InStrokeBlue = self:AddInput("Stroke Blue", "StrokeBlue", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.1, IC_ControlGroup = 5, IC_ControlID = 2, IC_Visible = false,
+        })
+
+        InStrokeWidth = self:AddInput("Stroke Width (px)", "StrokeWidth", {
+            LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+            INP_Default = 1.0, INP_MinScale = 0.0, INP_MaxScale = 8.0,
+            INP_MinAllowed = 0.0, INP_MaxAllowed = 64.0,
+        })
+
+        InStrokeOpacity = self:AddInput("Stroke Opacity", "StrokeOpacity", {
+            LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+            INP_Default = 1.0, INP_MinScale = 0.0, INP_MaxScale = 1.0,
+            INP_MinAllowed = 0.0, INP_MaxAllowed = 1.0,
+        })
+
+        InDrawWorld = self:AddInput("Draw World Boundary", "DrawWorld", {
+            LINKID_DataType = "Number", INPID_InputControl = "CheckboxControl",
+            INP_Integer = true, INP_Default = 0,
+        })
+
+        InDrawDisputed = self:AddInput("Draw Disputed Borders", "DrawDisputed", {
+            LINKID_DataType = "Number", INPID_InputControl = "CheckboxControl",
+            INP_Integer = true, INP_Default = 1,
+        })
+
+    self:EndControlNest()
+
+    self:BeginControlNest("Fill", "Fill", true, {})
+
+        -- Type any part of a country name to jump straight to it; this wins
+        -- over the dropdown below whenever it is non-empty.
+        InCountrySearch = add_text_input(self, "Country Search", "CountrySearch")
+
+        InCountry = self:AddInput("Country", "Country", {
+            LINKID_DataType = "Number", INPID_InputControl = "ComboControl",
+            INP_Integer = true, INP_Default = math.max(0, default_country_index() - 1),
+            INP_DoNotifyChanged = true,
+        })
+        if #COUNTRY_NAMES > 0 then
+            for _, name in ipairs(COUNTRY_NAMES) do
+                InCountry:SetAttrs({ CCS_AddString = name })
+            end
+        else
+            InCountry:SetAttrs({ CCS_AddString = "(data not loaded)" })
+        end
+
+        InFillColor = self:AddInput("Fill Color", "FillColor", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.85, IC_ControlGroup = 6, IC_ControlID = 0,
+        })
+        InFillGreen = self:AddInput("Fill Green", "FillGreen", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.12, IC_ControlGroup = 6, IC_ControlID = 1, IC_Visible = false,
+        })
+        InFillBlue = self:AddInput("Fill Blue", "FillBlue", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.12, IC_ControlGroup = 6, IC_ControlID = 2, IC_Visible = false,
+        })
+
+        InFillOpacity = self:AddInput("Fill Opacity", "FillOpacity", {
+            LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+            INP_Default = 1.0, INP_MinScale = 0.0, INP_MaxScale = 1.0,
+            INP_MinAllowed = 0.0, INP_MaxAllowed = 1.0,
+        })
+
+        InBaseFillColor = self:AddInput("All-Country Fill Color", "BaseFillColor", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.75, IC_ControlGroup = 8, IC_ControlID = 0,
+        })
+        InBaseFillGreen = self:AddInput("All-Country Fill Green", "BaseFillGreen", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.75, IC_ControlGroup = 8, IC_ControlID = 1, IC_Visible = false,
+        })
+        InBaseFillBlue = self:AddInput("All-Country Fill Blue", "BaseFillBlue", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.75, IC_ControlGroup = 8, IC_ControlID = 2, IC_Visible = false,
+        })
+
+        -- 0 = disabled. When > 0, every country is filled with this colour; the
+        -- selected country is excluded so its own fill (above) shows on top.
+        InBaseFillOpacity = self:AddInput("All-Country Fill Opacity", "BaseFillOpacity", {
+            LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+            INP_Default = 0.0, INP_MinScale = 0.0, INP_MaxScale = 1.0,
+            INP_MinAllowed = 0.0, INP_MaxAllowed = 1.0,
+        })
+
+    self:EndControlNest()
+
+    self:BeginControlNest("City Marker", "CityMarker", false, {})
+
+        -- Type any part of a "City, Country" label to select it; this wins over
+        -- the dropdown below whenever it is non-empty.
+        InCitySearch = add_text_input(self, "City Search", "CitySearch")
+
+        InCity = self:AddInput("City", "City", {
+            LINKID_DataType = "Number", INPID_InputControl = "ComboControl",
+            INP_Integer = true, INP_Default = 0,
+        })
+        -- Index 0 = no marker; 1..N map directly to CITIES[1..N].
+        InCity:SetAttrs({ CCS_AddString = "(none)" })
+        if #CITY_LABELS > 0 then
+            for _, lbl in ipairs(CITY_LABELS) do
+                InCity:SetAttrs({ CCS_AddString = lbl })
+            end
+        end
+
+        -- When enabled, the dot uses these coordinates instead of the City list.
+        InUseCustomDot = self:AddInput("Custom Position", "UseCustomDot", {
+            LINKID_DataType = "Number", INPID_InputControl = "CheckboxControl",
+            INP_Integer = true, INP_Default = 0,
+        })
+        InCustomLat = self:AddInput("Custom Latitude", "CustomLat", {
+            LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+            INP_Default = 0.0, INP_MinScale = -90.0, INP_MaxScale = 90.0,
+            INP_MinAllowed = -90.0, INP_MaxAllowed = 90.0,
+        })
+        InCustomLon = self:AddInput("Custom Longitude", "CustomLon", {
+            LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+            INP_Default = 0.0, INP_MinScale = -180.0, INP_MaxScale = 180.0,
+            INP_MinAllowed = -180.0, INP_MaxAllowed = 180.0,
+        })
+
+        InDotColor = self:AddInput("Dot Color", "DotColor", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 1.0, IC_ControlGroup = 7, IC_ControlID = 0,
+        })
+        InDotGreen = self:AddInput("Dot Green", "DotGreen", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.85, IC_ControlGroup = 7, IC_ControlID = 1, IC_Visible = false,
+        })
+        InDotBlue = self:AddInput("Dot Blue", "DotBlue", {
+            LINKID_DataType = "Number", INPID_InputControl = "ColorControl",
+            INP_Default = 0.1, IC_ControlGroup = 7, IC_ControlID = 2, IC_Visible = false,
+        })
+
+        InDotSize = self:AddInput("Dot Size (px)", "DotSize", {
+            LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+            INP_Default = 10.0, INP_MinScale = 0.0, INP_MaxScale = 40.0,
+            INP_MinAllowed = 0.0, INP_MaxAllowed = 256.0,
+        })
+
+        InDotOpacity = self:AddInput("Dot Opacity", "DotOpacity", {
+            LINKID_DataType = "Number", INPID_InputControl = "SliderControl",
+            INP_Default = 1.0, INP_MinScale = 0.0, INP_MaxScale = 1.0,
+            INP_MinAllowed = 0.0, INP_MaxAllowed = 1.0,
+        })
+
+    self:EndControlNest()
+
+    OutImage = self:AddOutput("Output", "Output", {
+        LINKID_DataType = "Image", LINK_Main = 1,
+    })
+    print("[WorldMap] Create() end (data " .. (DATA and "loaded" or "MISSING") .. ")")
+end
+
+-- ===========================================================================
+-- Projection maths (mirrors tools/worldmap/projection.py; constants come from
+-- the data file's meta so build and runtime never drift).
+-- ===========================================================================
+local PI = math.pi
+
+local function make_projection(meta, robinson)
+    local CX, KX, CY, KY = meta.CX, meta.KX, meta.CY, meta.KY
+    local lats, xs, ys = robinson.lats, robinson.xs, robinson.ys
+    local n = #lats
+
+    local function interp(arr, lat)
+        lat = math.abs(lat)
+        if lat >= 90.0 then return arr[n] end
+        local i = math.floor(lat / 5.0)              -- 0-based bucket
+        local lo = lats[i + 1]
+        local t = (lat - lo) / 5.0
+        return arr[i + 1] * (1.0 - t) + arr[i + 2] * t
+    end
+
+    local proj = {}
+    proj.width  = meta.width
+    proj.height = meta.height
+
+    function proj.forward(lon, lat)
+        local xf = interp(xs, lat)
+        local yf = interp(ys, lat)
+        local px = CX + KX * xf * (lon * PI / 180.0)
+        local sign = (lat >= 0.0) and 1.0 or -1.0
+        local py = CY - KY * yf * sign
+        return px, py
+    end
+
+    return proj
+end
+
+local function wrap180(lon)
+    return ((lon + 180.0) % 360.0) - 180.0
+end
+
+-- Split a wrapped geographic polyline at the +/-180 seam. Points are {lon,lat}.
+local function seam_split(poly)
+    local np = #poly
+    if np < 2 then return { poly } end
+    local pieces = {}
+    local cur = { poly[1] }
+    for i = 2, np do
+        local a, b = poly[i - 1], poly[i]
+        if math.abs(b[1] - a[1]) > 180.0 then
+            local b_un = b[1]
+            while b_un - a[1] > 180.0 do b_un = b_un - 360.0 end
+            while b_un - a[1] < -180.0 do b_un = b_un + 360.0 end
+            local seam_a = (b_un > a[1]) and 180.0 or -180.0
+            local span = b_un - a[1]
+            local t = (span ~= 0.0) and ((seam_a - a[1]) / span) or 0.0
+            if t < 0.0 then t = 0.0 elseif t > 1.0 then t = 1.0 end
+            local lat = a[2] + t * (b[2] - a[2])
+            cur[#cur + 1] = { seam_a, lat }
+            pieces[#pieces + 1] = cur
+            cur = { { -seam_a, lat }, b }
+        else
+            cur[#cur + 1] = b
+        end
+    end
+    pieces[#pieces + 1] = cur
+    return pieces
+end
+
+-- ===========================================================================
+-- Geometry preparation cache: geographic contours -> screen polylines.
+-- Cached by (meridian, output size, zoom, center) so animating a single
+-- parameter never re-projects the whole map more than needed.
+-- ===========================================================================
+local GEO_CACHE = { key = nil, meridian = nil, geo = nil }
+
+-- Convert one country's pixel-normalised geographic polys to screen space.
+-- geo poly entries are flat arrays {lon,lat,lon,lat,...}.
+-- break_edges: when true, split the output where an edge runs along the top or
+-- bottom map border. Those borders are artificial clip edges (e.g. Antarctica's
+-- flat bottom) that are hidden in a filled map but read as ugly straight lines
+-- when stroked. Fill must NOT break edges (it needs closed rings), so it passes
+-- break_edges = false / nil.
+local function project_polys(flatpolys, proj, meridian, xf, break_edges)
+    -- xf: function(px_map, py_map) -> (sx, sy) applying zoom/pan/output mapping
+    local mapH = proj.height
+    local EDGE = 8.0                       -- map-pixel tolerance for "on border"
+    local out = {}
+    for _, flat in ipairs(flatpolys) do
+        local geo = {}
+        local m = #flat
+        for i = 1, m, 2 do
+            geo[#geo + 1] = { wrap180(flat[i] - meridian), flat[i + 1] }
+        end
+        for _, piece in ipairs(seam_split(geo)) do
+            local scr = {}
+            local prev_edge = nil
+            local first = true
+            for _, pt in ipairs(piece) do
+                local px, py = proj.forward(pt[1], pt[2])
+                local sx, sy = xf(px, py)
+                local edge = nil
+                if break_edges then
+                    if py <= EDGE then edge = 1
+                    elseif py >= mapH - EDGE then edge = 2 end
+                end
+                -- The segment prev->pt runs along a map border (both endpoints
+                -- on the same top/bottom clip edge): drop it by ending the
+                -- current polyline and starting a fresh one at this point.
+                if (not first) and edge and prev_edge == edge then
+                    if #scr >= 4 then out[#out + 1] = scr end
+                    scr = {}
+                end
+                scr[#scr + 1] = sx
+                scr[#scr + 1] = sy
+                prev_edge = edge
+                first = false
+            end
+            if #scr >= 4 then out[#out + 1] = scr end
+        end
+    end
+    return out
+end
+
+-- Project polygons for FILLING. Unlike project_polys (which seam-splits rings
+-- into OPEN polylines suitable for stroking), a fill needs CLOSED rings. A ring
+-- that crosses the +/-180 seam is cut into sub-rings, each of which closes
+-- cleanly along the seam edge (fill_polys wraps last->first). This avoids the
+-- chord-across-the-map artifact that previously corrupted the Antarctica and
+-- Russia fills.
+local function project_fill_polys(flatpolys, proj, meridian, xf)
+    local out = {}
+    for _, flat in ipairs(flatpolys) do
+        local n = #flat
+        if n >= 6 then
+            local geo = {}
+            for i = 1, n, 2 do
+                geo[#geo + 1] = { wrap180(flat[i] - meridian), flat[i + 1] }
+            end
+            local m = #geo
+            local subpaths = {}
+            local cur = {}
+            local crossed = false
+            for i = 1, m do
+                local a = geo[i]
+                local b = geo[(i % m) + 1]
+                cur[#cur + 1] = a
+                local dl = b[1] - a[1]
+                if dl > 180.0 or dl < -180.0 then
+                    crossed = true
+                    local exit_x, enter_x, bun
+                    if dl > 180.0 then
+                        exit_x, enter_x, bun = -180.0, 180.0, b[1] - 360.0
+                    else
+                        exit_x, enter_x, bun = 180.0, -180.0, b[1] + 360.0
+                    end
+                    local denom = bun - a[1]
+                    local t = (denom ~= 0.0) and ((exit_x - a[1]) / denom) or 0.0
+                    local latc = a[2] + t * (b[2] - a[2])
+                    cur[#cur + 1] = { exit_x, latc }
+                    subpaths[#subpaths + 1] = cur
+                    cur = { { enter_x, latc } }
+                end
+            end
+            if crossed and #subpaths > 0 then
+                -- Stitch the trailing arc back onto the first sub-ring so the
+                -- ring closes across its original start point.
+                local first = subpaths[1]
+                for _, p in ipairs(first) do cur[#cur + 1] = p end
+                subpaths[1] = cur
+            elseif #cur > 0 then
+                subpaths[#subpaths + 1] = cur
+            end
+            for _, sp in ipairs(subpaths) do
+                local scr = {}
+                for _, p in ipairs(sp) do
+                    local px, py = proj.forward(p[1], p[2])
+                    local sx, sy = xf(px, py)
+                    scr[#scr + 1] = sx
+                    scr[#scr + 1] = sy
+                end
+                if #scr >= 6 then out[#out + 1] = scr end
+            end
+        end
+    end
+    return out
+end
+
+-- ===========================================================================
+-- Rasterisation: scanline polygon fill + antialiased polyline stroke, writing
+-- premultiplied RGBA into a Fusion Image via SetPixel-style pixel access.
+-- ===========================================================================
+
+-- Even-odd scanline fill of a set of screen polygons (flat {x,y,...}).
+local function fill_polys(polys, w, h, r, g, b, a, plot)
+    if a <= 0.0 then return end
+    -- Determine vertical extent.
+    local ymin, ymax = h, 0
+    for _, poly in ipairs(polys) do
+        for i = 2, #poly, 2 do
+            local y = poly[i]
+            if y < ymin then ymin = y end
+            if y > ymax then ymax = y end
+        end
+    end
+    local y0 = math.max(0, math.floor(ymin))
+    local y1 = math.min(h - 1, math.ceil(ymax))
+    for y = y0, y1 do
+        local sy = y + 0.5
+        local xs = {}
+        for _, poly in ipairs(polys) do
+            local np = #poly
+            local j = np - 1  -- index of last vertex x
+            local pxk = poly[np - 1]
+            local pyk = poly[np]
+            for i = 1, np, 2 do
+                local xi, yi = poly[i], poly[i + 1]
+                if (yi > sy) ~= (pyk > sy) then
+                    local xint = xi + (sy - yi) * (pxk - xi) / (pyk - yi)
+                    xs[#xs + 1] = xint
+                end
+                pxk, pyk = xi, yi
+            end
+        end
+        table.sort(xs)
+        for k = 1, #xs - 1, 2 do
+            local xa = math.max(0, math.floor(xs[k] + 0.5))
+            local xb = math.min(w - 1, math.ceil(xs[k + 1] - 0.5))
+            for x = xa, xb do
+                plot(x, y, r, g, b, a)
+            end
+        end
+    end
+end
+
+-- Antialiased line segment (width in screen pixels), coverage-based over-plot.
+local function stroke_segment(x0, y0, x1, y1, half, w, h, r, g, b, a, plot)
+    local dx, dy = x1 - x0, y1 - y0
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len < 1e-6 then return end
+    local nx, ny = -dy / len, dx / len   -- unit normal
+    local ext = half + 1.0
+    local minx = math.max(0, math.floor(math.min(x0, x1) - ext))
+    local maxx = math.min(w - 1, math.ceil(math.max(x0, x1) + ext))
+    local miny = math.max(0, math.floor(math.min(y0, y1) - ext))
+    local maxy = math.min(h - 1, math.ceil(math.max(y0, y1) + ext))
+    local inv_len2 = 1.0 / (len * len)
+    for y = miny, maxy do
+        for x = minx, maxx do
+            local px, py = x + 0.5, y + 0.5
+            -- distance from point to segment
+            local t = ((px - x0) * dx + (py - y0) * dy) * inv_len2
+            if t < 0.0 then t = 0.0 elseif t > 1.0 then t = 1.0 end
+            local cx, cy = x0 + t * dx, y0 + t * dy
+            local ddx, ddy = px - cx, py - cy
+            local dist = math.sqrt(ddx * ddx + ddy * ddy)
+            local cov = half + 0.5 - dist          -- 1px AA falloff
+            if cov > 0.0 then
+                if cov > 1.0 then cov = 1.0 end
+                plot(x, y, r, g, b, a * cov)
+            end
+        end
+    end
+end
+
+local function stroke_polys(polys, half, w, h, r, g, b, a, plot)
+    if a <= 0.0 or half <= 0.0 then return end
+    for _, poly in ipairs(polys) do
+        for i = 1, #poly - 3, 2 do
+            stroke_segment(poly[i], poly[i + 1], poly[i + 2], poly[i + 3],
+                           half, w, h, r, g, b, a, plot)
+        end
+    end
+end
+
+-- Filled, antialiased disc centred on (cx, cy) with the given radius (screen px).
+local function draw_dot(cx, cy, radius, r, g, b, a, w, h, plot)
+    if a <= 0.0 or radius <= 0.0 then return end
+    local ext = radius + 1.0
+    local minx = math.max(0, math.floor(cx - ext))
+    local maxx = math.min(w - 1, math.ceil(cx + ext))
+    local miny = math.max(0, math.floor(cy - ext))
+    local maxy = math.min(h - 1, math.ceil(cy + ext))
+    for y = miny, maxy do
+        for x = minx, maxx do
+            local dx, dy = (x + 0.5) - cx, (y + 0.5) - cy
+            local dist = math.sqrt(dx * dx + dy * dy)
+            local cov = radius + 0.5 - dist          -- 1px AA edge
+            if cov > 0.0 then
+                if cov > 1.0 then cov = 1.0 end
+                plot(x, y, r, g, b, a * cov)
+            end
+        end
+    end
+end
+
+-- ===========================================================================
+-- Rendering (wrapped by Process in a pcall so any Fusion-API error surfaces on
+-- the Console instead of silently turning the tool tile red).
+-- ===========================================================================
+
+-- Build a fresh, fully transparent output frame. All Fusion-API access is kept
+-- inside functions (never at module load) so a load-time error can't leave the
+-- tool permanently red before Process() is even defined.
+local function new_frame(req)
+    local imgattrs = {
+        IMG_Document = self.Comp,
+        { IMG_Channel = "Red" },
+        { IMG_Channel = "Green" },
+        { IMG_Channel = "Blue" },
+        { IMG_Channel = "Alpha" },
+        IMG_Width  = Width,
+        IMG_Height = Height,
+        IMG_XScale = XAspect,
+        IMG_YScale = YAspect,
+        IMAT_OriginalWidth  = Width,
+        IMAT_OriginalHeight = Height,
+        IMG_Quality = not req:IsQuick(),
+        IMG_MotionBlurQuality = not req:IsNoMotionBlur(),
+    }
+    if not req:IsStampOnly() then imgattrs.IMG_ProxyScale = 1 end
+    local img = Image(imgattrs)
+    img:Clear()   -- zero every channel (fresh frame is fully transparent)
+    return img
+end
+
+-- Read every control once into a plain table so Process can both build a cache
+-- signature and hand the same values to render_into (no double GetValue).
+local function read_controls(req)
+    local P = {}
+    local originSel = math.floor(InOrigin:GetValue(req).Value + 0.5)
+    if originSel >= 0 and originSel < #ORIGIN_PRESETS and ORIGIN_PRESETS[originSel + 1] ~= nil then
+        P.meridian = ORIGIN_PRESETS[originSel + 1]
+    else
+        P.meridian = InCustomMeridian:GetValue(req).Value
+    end
+    local zoom = InZoom:GetValue(req).Value
+    if zoom < 0.01 then zoom = 0.01 end
+    P.zoom = zoom
+    local center = InCenter:GetValue(req)
+    P.cx, P.cy = center.X, center.Y       -- 0..1, y up in Fusion
+    P.strokeW  = InStrokeWidth:GetValue(req).Value
+    P.strokeOp = InStrokeOpacity:GetValue(req).Value
+    P.sr = InStrokeColor:GetValue(req).Value
+    P.sg = InStrokeGreen:GetValue(req).Value
+    P.sb = InStrokeBlue:GetValue(req).Value
+    P.fillOp = InFillOpacity:GetValue(req).Value
+    P.fr = InFillColor:GetValue(req).Value
+    P.fg = InFillGreen:GetValue(req).Value
+    P.fb = InFillBlue:GetValue(req).Value
+    -- Optional fill applied to every country except the selected one.
+    P.baseFillOp = InBaseFillOpacity:GetValue(req).Value
+    P.bfr = InBaseFillColor:GetValue(req).Value
+    P.bfg = InBaseFillGreen:GetValue(req).Value
+    P.bfb = InBaseFillBlue:GetValue(req).Value
+    P.drawWorld    = InDrawWorld:GetValue(req).Value >= 0.5
+    P.drawDisputed = InDrawDisputed:GetValue(req).Value >= 0.5
+    P.countrySel   = math.floor(InCountry:GetValue(req).Value + 0.5) + 1  -- 1-based
+    -- Country search field overrides the dropdown when it matches a name.
+    local cmatch = find_label_match(COUNTRY_NAMES, input_text(InCountrySearch, req))
+    if cmatch then P.countrySel = cmatch end
+    -- City marker (0 = none, 1..N -> CITIES) and its dot appearance.
+    P.citySel = math.floor(InCity:GetValue(req).Value + 0.5)
+    -- City search field overrides the dropdown when it matches a label.
+    local citymatch = find_label_match(CITY_LABELS, input_text(InCitySearch, req))
+    if citymatch then P.citySel = citymatch end
+    P.useCustomDot = InUseCustomDot:GetValue(req).Value >= 0.5
+    P.customLat = InCustomLat:GetValue(req).Value
+    P.customLon = InCustomLon:GetValue(req).Value
+    P.dotSize = InDotSize:GetValue(req).Value
+    P.dotOp   = InDotOpacity:GetValue(req).Value
+    P.dr = InDotColor:GetValue(req).Value
+    P.dg = InDotGreen:GetValue(req).Value
+    P.db = InDotBlue:GetValue(req).Value
+    return P
+end
+
+-- Compact string identifying a fully-rendered frame: any change here means the
+-- pixels differ, so it keys the result cache. Includes size + quality flags so
+-- proxy/quick and full-quality passes never alias to each other.
+local function params_signature(P, realw, realh, req)
+    return table.concat({
+        realw, realh,
+        P.meridian, P.zoom, P.cx, P.cy,
+        P.strokeW, P.strokeOp, P.sr, P.sg, P.sb,
+        P.fillOp, P.fr, P.fg, P.fb,
+        P.baseFillOp, P.bfr, P.bfg, P.bfb,
+        P.drawWorld and 1 or 0, P.drawDisputed and 1 or 0, P.countrySel,
+        P.citySel, P.dotSize, P.dotOp, P.dr, P.dg, P.db,
+        P.useCustomDot and 1 or 0, P.customLat, P.customLon,
+        req:IsQuick() and 1 or 0,
+        req:IsStampOnly() and 1 or 0,
+        req:IsNoMotionBlur() and 1 or 0,
+    }, ":")
+end
+
+local function render_into(req, img, P)
+    -- Global Width/Height are not reliably populated for a Creator in all render
+    -- passes; the freshly-built output image always carries the true dimensions.
+    local realw = img.Width  or Width
+    local realh = img.Height or Height
+
+    load_data()
+    load_cities()
+    if not DATA then
+        -- Data missing: leave the (already-set) transparent frame and report.
+        if DATA_ERROR then print("[WorldMap] " .. DATA_ERROR) end
+        return
+    end
+
+    -- Controls were read once by Process (read_controls) and passed in via P.
+    local meridian     = P.meridian
+    local zoom         = P.zoom
+    local cx, cy       = P.cx, P.cy
+    local strokeW      = P.strokeW
+    local strokeOp     = P.strokeOp
+    local sr, sg, sb   = P.sr, P.sg, P.sb
+    local fillOp       = P.fillOp
+    local fr, fg, fb   = P.fr, P.fg, P.fb
+    local baseFillOp   = P.baseFillOp
+    local bfr, bfg, bfb = P.bfr, P.bfg, P.bfb
+    local drawWorld    = P.drawWorld
+    local drawDisputed = P.drawDisputed
+    local countrySel   = P.countrySel
+    local citySel      = P.citySel
+    local dotSize      = P.dotSize
+    local dotOp        = P.dotOp
+    local dr, dg, db   = P.dr, P.dg, P.db
+    local useCustomDot = P.useCustomDot
+    local customLat    = P.customLat
+    local customLon    = P.customLon
+
+    -- --- Projection + screen mapping --------------------------------------
+    local proj = make_projection(DATA.meta, DATA.robinson)
+    local mapW, mapH = proj.width, proj.height
+
+    -- Base scale to fit the map width to the output width, times user zoom.
+    local scale = (realw / mapW) * zoom
+    -- Map centre (in map pixels) that should land at the control centre.
+    local mapcx = DATA.meta.CX
+    local mapcy = DATA.meta.CY
+    -- Fusion y is up; image rows are top-down. Convert control centre to pixels.
+    local ccx_px = cx * realw
+    local ccy_px = (1.0 - cy) * realh
+
+    local function to_screen(px, py)
+        local sx = ccx_px + (px - mapcx) * scale
+        local sy = ccy_px + (py - mapcy) * scale
+        return sx, sy
+    end
+
+    -- --- Pixel plot (premultiplied "over" compositing) --------------------
+    local pget = img.GetPixel
+    local pset = img.SetPixel
+    local px_scratch = Pixel()
+    local function plot(x, y, r, g, b, a)
+        if a <= 0.0 then return end
+        if a > 1.0 then a = 1.0 end
+        x = math.floor(x)
+        y = math.floor(y)
+        -- Guard against any out-of-range coordinate: an out-of-bounds Get/SetPixel
+        -- is undefined in the Fuse API and can hard-crash Resolve.
+        if x < 0 or x >= realw or y < 0 or y >= realh then return end
+        local yy = realh - 1 - y   -- Fusion image origin is bottom-left; flip rows
+        img:GetPixel(x, yy, px_scratch)
+        local ia = 1.0 - a
+        px_scratch.R = r * a + px_scratch.R * ia
+        px_scratch.G = g * a + px_scratch.G * ia
+        px_scratch.B = b * a + px_scratch.B * ia
+        px_scratch.A = a + px_scratch.A * ia
+        img:SetPixel(x, yy, px_scratch)
+    end
+
+    -- Base-fill plot: writes each pixel at most ONCE (first writer wins). The
+    -- base fill runs first on a freshly-cleared frame, so a non-zero alpha means
+    -- the pixel is already base-filled. This keeps overlapping country polygons
+    -- from compositing twice, which previously made some areas look brighter.
+    local function basefill_plot(x, y, r, g, b, a)
+        if a <= 0.0 then return end
+        if a > 1.0 then a = 1.0 end
+        x = math.floor(x)
+        y = math.floor(y)
+        if x < 0 or x >= realw or y < 0 or y >= realh then return end
+        local yy = realh - 1 - y
+        img:GetPixel(x, yy, px_scratch)
+        if px_scratch.A > 0.0 then return end   -- already base-filled
+        px_scratch.R = r * a
+        px_scratch.G = g * a
+        px_scratch.B = b * a
+        px_scratch.A = a
+        img:SetPixel(x, yy, px_scratch)
+    end
+
+    -- --- Select country (validate; fall back gracefully) ------------------
+    local sel = COUNTRY_INDEX[countrySel]
+    if not sel then sel = COUNTRY_INDEX[default_country_index()] end
+
+    -- --- 0) Optional base fill for every country (selected one excluded so
+    --        its own fill, drawn later in step 4, reads on top) ------------
+    if baseFillOp > 0.0 then
+        for _, c in ipairs(DATA.countries) do
+            if c.kind ~= "ocean" and c ~= sel then
+                local bp = project_fill_polys(c.polys, proj, meridian, to_screen)
+                fill_polys(bp, realw, realh, bfr, bfg, bfb, baseFillOp, basefill_plot)
+            end
+        end
+    end
+
+    -- --- 1) Optional world boundary --------------------------------------
+    local half = strokeW * 0.5
+    if drawWorld and DATA.world and DATA.world.polys then
+        local wp = project_polys(DATA.world.polys, proj, meridian, to_screen)
+        stroke_polys(wp, half, realw, realh, sr, sg, sb, strokeOp, plot)
+    end
+
+    -- --- 2) All country outlines (constant screen-pixel width) ------------
+    -- Skip the selected country so its fill reads cleanly with no border of
+    -- its own (neighbours still stroke their shared edges).
+    for _, c in ipairs(DATA.countries) do
+        if c.kind ~= "ocean" and c ~= sel then
+            local sp = project_polys(c.polys, proj, meridian, to_screen, true)
+            stroke_polys(sp, half, realw, realh, sr, sg, sb, strokeOp, plot)
+        end
+    end
+
+    -- --- 3) Optional disputed borders ------------------------------------
+    if drawDisputed and DATA.disputed and DATA.disputed.polys and #DATA.disputed.polys > 0 then
+        local dp = project_polys(DATA.disputed.polys, proj, meridian, to_screen, true)
+        stroke_polys(dp, half, realw, realh, sr, sg, sb, strokeOp * 0.8, plot)
+    end
+
+    -- --- 4) Fill the selected country ON TOP so no stroke cuts into it ----
+    if sel and fillOp > 0.0 then
+        local fpolys = project_fill_polys(sel.polys, proj, meridian, to_screen)
+        fill_polys(fpolys, realw, realh, fr, fg, fb, fillOp, plot)
+    end
+
+    -- --- 5) City marker dot, drawn last so it sits on top of everything ---
+    if dotOp > 0.0 and dotSize > 0.0 then
+        local dotLat, dotLon
+        if useCustomDot then
+            dotLat, dotLon = customLat, customLon
+        elseif citySel >= 1 then
+            local city = CITIES[citySel]
+            if city then dotLat, dotLon = city.lat, city.lon end
+        end
+        if dotLat then
+            local lonrel = wrap180(dotLon - meridian)
+            local px, py = proj.forward(lonrel, dotLat)
+            local sx, sy = to_screen(px, py)
+            draw_dot(sx, sy, dotSize * 0.5, dr, dg, db, dotOp, realw, realh, plot)
+        end
+    end
+end
+
+-- ===========================================================================
+-- Process(): create the output frame, publish a transparent frame immediately
+-- (so downstream tools always have an image), then draw into it. Every stage is
+-- guarded and logged so the Console pinpoints any Fusion-API failure instead of
+-- the tool silently going red / "cannot get image".
+-- ===========================================================================
+function Process(req)
+    local img
+    local ok_f, err_f = pcall(function() img = new_frame(req) end)
+    if not ok_f or not img then
+        print("[WorldMap] new_frame() failed: " .. tostring(err_f))
+        return
+    end
+    local realw = img.Width  or Width
+    local realh = img.Height or Height
+
+    -- Guarantee downstream always gets an image, even if drawing fails.
+    OutImage:Set(req, img)
+
+    local ok_p, P = pcall(read_controls, req)
+    if not ok_p or not P then
+        print("[WorldMap] read_controls failed: " .. tostring(P))
+        return
+    end
+
+    -- Result cache: an identical request (same inputs, size and quality) reuses
+    -- the previously rendered frame instead of re-rasterising the whole map.
+    local sig = params_signature(P, realw, realh, req)
+    if CACHE_SIG == sig and CACHE_IMG then
+        OutImage:Set(req, CACHE_IMG)
+        return
+    end
+
+    local ok_d, err_d = pcall(render_into, req, img, P)
+    if not ok_d then
+        print("[WorldMap] draw failed: " .. tostring(err_d))
+    end
+
+    OutImage:Set(req, img)
+    CACHE_SIG = sig
+    CACHE_IMG = img
+end
+
+-- ===========================================================================
+-- NotifyChanged(): keep the Custom Meridian control visible only when relevant.
+-- ===========================================================================
+function NotifyChanged(inp, param, time)
+    if inp == InOrigin and param then
+        local sel = math.floor(param.Value + 0.5)
+        local isCustom = (sel == (#ORIGIN_PRESETS - 1))  -- last index = Custom
+        if InCustomMeridian then
+            InCustomMeridian:SetAttrs({ IC_Visible = isCustom })
+        end
+    end
+end

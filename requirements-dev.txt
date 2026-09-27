@@ -1,0 +1,13 @@
+# Build/test-time dependencies for the WorldMap Fuse.
+# The runtime Fuse itself has NO Python dependency — these are only needed to
+# regenerate generated/worldmap_data.lua and to run the test suite.
+#
+# The build tool and library use only the Python standard library.
+pytest>=8.0
+
+# Only needed to regenerate generated/cities_data.lua (bundled offline GeoNames
+# extract: population + coordinates for the top-10-per-country city markers).
+geonamescache>=2.0
+# Used by tools/render_previews.py to rasterise the Fuse output to PNG.
+Pillow>=10.0
+lupa>=2.0
